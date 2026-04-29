@@ -181,7 +181,10 @@ For incremental reconstruction, the system performs a local BA strategy:
 
 This is a simplified local optimization strategy designed for learning and small-scale experiments.
 
-**8. Reprojection Error Analysis and Outlier Cleaning**
+**8. Pangolin**
+Real-time 3D Visualization: Integrated Pangolin-based viewer to visualize the incremental reconstruction process, including sparse point clouds, camera frustums, camera trajectory, and the currently registered frame.
+
+**9. Reprojection Error Analysis and Outlier Cleaning**
 
 After local BA, MiniSfM evaluates reprojection error for all visible 3D point observations.
 
@@ -197,7 +200,7 @@ Points with reprojection error above a threshold are removed from the sparse map
 
 This module helps connect the geometric optimization result with a quantitative quality measure.
 
-**9. Export**
+**10. Export**
 
 MiniSfM currently supports two export formats:
 
@@ -245,6 +248,7 @@ MiniSfM/
 - OpenCV
 - Eigen3
 - Ceres Solver
+- Pangolin
 
 Recommended environment:
 ```txt
@@ -253,6 +257,7 @@ OpenCV 4.x
 Ceres Solver
 Eigen3
 CMake >= 3.10
+Pangolin: for real-time 3D visualization of camera poses and sparse point clouds
 ```
 ## Build
 ```bah
@@ -288,6 +293,20 @@ The program will:
 - run local bundle adjustment
 - clean high-error points
 - export sparse point cloud and COLMAP-style files
+- 
+##  Visualization (Pangolin 可视化)
+
+The system launches a Pangolin-based 3D viewer during reconstruction.  
+系统在增量重建过程中启动 Pangolin 三维窗口，用于显示稀疏点云、已注册相机位姿、相机运动轨迹以及当前注册帧。
+
+This visualization module is mainly used for debugging and analyzing the incremental SfM pipeline, especially:
+  * camera pose registration by PnP;
+  * sparse map growth by triangulation;
+  * map refinement after local bundle adjustment.
+
+If the Pangolin window does not appear, please check whether OpenGL and Pangolin are correctly installed in your system environment.
+
+If the Pangolin window does not appear, please check whether OpenGL and Pangolin are correctly installed in your system environment.
 
 ## Output
 

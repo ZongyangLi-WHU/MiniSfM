@@ -1,15 +1,33 @@
-# 忽略编译输出目录
+# build files
 build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+*.cmake
 
-# 忽略本地配置
-.vscode/
-
-# 忽略测试数据和生成的大型点云文件
-data/
-*.ply
-
-# 忽略临时文件
-*.o
+# executable
+sfm_test
 *.out
-*.log
+
+# data and outputs
+data/
+output/
+outputs/
+*.ply
+*.npy
+*.bin
+
+# COLMAP outputs
+colmap_workspace/
+sparse/
+dense/
+
+# system files
 .DS_Store
+.vscode/
+.idea/
+
+# temporary
+*.log
+*.tmp

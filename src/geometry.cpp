@@ -71,43 +71,50 @@ void PoseEstimator::triangulate(FeatureData& data1,
     }
 
     // 3. 执行三角化
-    cv::Mat points4D; // 输出的齐次坐标矩阵，形状为 4 x N
+    cv::Mat points4D;
     cv::triangulatePoints(P1, P2, pts1, pts2, points4D);
 
-    // 4. 将齐次坐标 (x,y,z,w) 转换为非齐次坐标 (x,y,z)
+    points4D.convertTo(points4D, CV_64F);
+
     for (int i = 0; i < points4D.cols; i++) {
-        // 提取第 i 列
-        cv::Mat col = points4D.col(i); 
-        
-        // 完成齐次坐标除法
-        // 获取 x, y, z, w 的值，注意 points4D 通常是 CV_64F (double) 或 CV_32F (float) 类型
-        // 这里为了安全，我们用 double: col.at<double>(0, 0) 就是 x
-        float x = col.at<float>(0, 0);
-        float y = col.at<float>(1, 0);
-        float z = col.at<float>(2, 0);
-        float w = col.at<float>(3, 0);
-        
-        // 齐次除法：如果 w 为 0，说明点在无穷远处，通常应该剔除
-        if (std::abs(w) > 1e-5) {
-            Point3D new_pt;
-            new_pt.pt = cv::Point3d(x/w, y/w, z/w);
-           
-            // 2. 将观测记录写入 track 中
-            int idx1 = matches[i].queryIdx;
-            int idx2 = matches[i].trainIdx;
-            new_pt.track[data1.image_id] = idx1;
-            new_pt.track[data2.image_id] = idx2;
+        double x = points4D.at<double>(0, i);
+        double y = points4D.at<double>(1, i);
+        double z = points4D.at<double>(2, i);
+        double w = points4D.at<double>(3, i);
 
-            // 3.将新点加入全局点云 并获取其在全局数组中的索引
-            int new_pt_index = global_points.size();
-            global_points.push_back(new_pt);
-
-            // 4. 反向更新2D 图像特征的引用
-            data1.point3d_idx[idx1] = new_pt_index;
-            data2.point3d_idx[idx2] = new_pt_index;
+        if (std::abs(w) < 1e-8) {
+            continue;
         }
-        
-        
+
+        cv::Point3d X(x / w, y / w, z / w);
+
+        if (!std::isfinite(X.x) || !std::isfinite(X.y) || !std::isfinite(X.z)) {
+            continue;
+        }
+
+        // 检查点是否在两个相机前方
+        cv::Mat X_mat = (cv::Mat_<double>(3, 1) << X.x, X.y, X.z);
+        cv::Mat X_cam1 = R1 * X_mat + t1;
+        cv::Mat X_cam2 = R2 * X_mat + t2;
+
+        if (X_cam1.at<double>(2) <= 0 || X_cam2.at<double>(2) <= 0) {
+            continue;
+        }
+
+        Point3D new_pt;
+        new_pt.pt = X;
+
+        int idx1 = matches[i].queryIdx;
+        int idx2 = matches[i].trainIdx;
+
+        new_pt.track[data1.image_id] = idx1;
+        new_pt.track[data2.image_id] = idx2;
+
+        int new_pt_index = static_cast<int>(global_points.size());
+        global_points.push_back(new_pt);
+
+        data1.point3d_idx[idx1] = new_pt_index;
+        data2.point3d_idx[idx2] = new_pt_index;
     }
 
     std::cout << "Triangulated " << global_points.size() << " 3D points." << std::endl;
@@ -150,33 +157,54 @@ bool PoseEstimator::estimatePnP(const std::vector<cv::Point3f>& object_3d,
                                 const std::vector<cv::Point2f>& object_2d,
                                 const cv::Mat& K,
                                 cv::Mat& R,
-                                cv::Mat& t) {
+                                cv::Mat& t,
+                                std::vector<int>* inliers_out) {
     
-    // 安全检查：PnP 算法至少需要 4 个对应点对才能稳定求解
+    // PnP 理论上至少需要 4 个点；工程上后面 trackAndMapIncremental 还会要求更多
     if (object_3d.size() < 4) {
-        std::cerr << "Error: Not enough points for PnP estimation. Need at least 4, got " 
+        std::cerr << "Error: Not enough points for PnP estimation. Need at least 4, got "
                   << object_3d.size() << std::endl;
         return false;
     }
 
-    cv::Mat rvec; // 用于接收 PnP 输出的 3x1 旋转向量
-    std::vector<int> inliers; // 用于记录 RANSAC 筛选出的内点索引
+    cv::Mat rvec;
+    std::vector<int> inliers;
 
-    // 调用 OpenCV 的 PnP RANSAC 接口
-    // 参数：3D点, 2D点, 内参矩阵K, 畸变系数(传空即可), 输出旋转向量, 输出平移向量, 是否使用初始猜测, RANSAC迭代次数, 重投影误差阈值, 置信度, 输出内点
-    bool success = cv::solvePnPRansac(object_3d, object_2d, K, cv::noArray(), 
-                                      rvec, t, false, 100, 8.0, 0.99, inliers);
+    bool success = cv::solvePnPRansac(
+        object_3d,
+        object_2d,
+        K,
+        cv::noArray(),
+        rvec,
+        t,
+        false,
+        100,
+        8.0,
+        0.99,
+        inliers
+    );
 
-    if (success) {
-        // 最关键的一步：将旋转向量转换为 3x3 旋转矩阵 R
-        cv::Rodrigues(rvec, R);
-        std::cout << "PnP solved successfully! Inliers: " << inliers.size() 
-                  << " / " << object_3d.size() << std::endl;
-    } else {
+    if (!success) {
         std::cerr << "PnP estimation failed!" << std::endl;
+        return false;
     }
 
-    return success;
+    if (inliers.empty()) {
+        std::cerr << "PnP estimation failed: no RANSAC inliers." << std::endl;
+        return false;
+    }
+
+    cv::Rodrigues(rvec, R);
+
+    if (inliers_out) {
+        *inliers_out = inliers;
+    }
+
+    std::cout << "PnP solved successfully! Inliers: "
+              << inliers.size() << " / " << object_3d.size()
+              << std::endl;
+
+    return true;
 }
 
 void PoseEstimator::optimize(std::map<int, cv::Mat>& camera_R,
@@ -184,7 +212,7 @@ void PoseEstimator::optimize(std::map<int, cv::Mat>& camera_R,
                              std::vector<Point3D>& global_points,
                              const std::map<int, FeatureData>& all_features,
                              const cv::Mat& K,
-                             const std::set<int>& active_cameras = std::set<int>()) {
+                             const std::set<int>& active_cameras) {
     
     ceres::Problem problem;
 
@@ -309,7 +337,7 @@ void PoseEstimator::optimize(std::map<int, cv::Mat>& camera_R,
 void PoseEstimator::analyzeAndCleanErrors(const std::map<int, cv::Mat>& camera_R,
                                           const std::map<int, cv::Mat>& camera_t,
                                           std::vector<Point3D>& global_points,
-                                          const std::map<int, FeatureData>& all_features,
+                                          std::map<int, FeatureData>& all_features,
                                           const cv::Mat& K,
                                           double error_threshold) {
     
@@ -377,6 +405,38 @@ void PoseEstimator::analyzeAndCleanErrors(const std::map<int, cv::Mat>& camera_R
 
     // 覆盖旧的点云数据
     global_points = cleaned_points;
+
+    // 重要：清洗点云后，global_points 的下标会重新排列。
+    // 因此必须重建 all_features[*].point3d_idx，避免后续 PnP 使用旧索引。
+
+    // 1. 先把所有 2D 特征点对应的 3D 索引全部清空
+    for (auto& pair : all_features) {
+        FeatureData& feature = pair.second;
+        std::fill(feature.point3d_idx.begin(),
+                feature.point3d_idx.end(),
+                -1);
+    }
+
+    // 2. 再根据清洗后的 global_points 的 track 重新写回 point3d_idx
+    for (size_t new_idx = 0; new_idx < global_points.size(); ++new_idx) {
+        const Point3D& pt = global_points[new_idx];
+
+        for (const auto& obs : pt.track) {
+            int image_id = obs.first;
+            int kp_idx = obs.second;
+
+            auto it = all_features.find(image_id);
+            if (it == all_features.end()) {
+                continue;
+            }
+
+            FeatureData& feature = it->second;
+
+            if (kp_idx >= 0 && kp_idx < static_cast<int>(feature.point3d_idx.size())) {
+                feature.point3d_idx[kp_idx] = static_cast<int>(new_idx);
+            }
+        }
+    }
 
     // 打印量化评估报告
     double mean_error = total_observations > 0 ? (total_error / total_observations) : 0.0;

@@ -11,11 +11,25 @@ SfMSystem::SfMSystem(const cv::Mat& K) : current_frame_id_(-1) {
     std::cout << "[SfMSystem] System initialized with camera intrinsics." << std::endl;
 }
 
-// 阶段 1：数据摄入与预处理
 void SfMSystem::addImage(const cv::Mat& image, int frame_id) {
+    // 兼容旧调用：如果外部没有传真实文件名，就生成一个默认名
+    std::string default_name = "img" + std::to_string(frame_id) + ".jpg";
+    addImage(image, frame_id, default_name);
+}
+
+void SfMSystem::addImage(const cv::Mat& image,
+                         int frame_id,
+                         const std::string& image_name) {
     extractFeatures(image, frame_id);
+
+    // 记录真实文件名，后续 exportToCOLMAP() 会用到
+    image_names_[frame_id] = image_name;
+
     pending_frames_.insert(frame_id);
-    std::cout << "[SfMSystem] Frame " << frame_id << " added to pending queue." << std::endl;
+
+    std::cout << "[SfMSystem] Frame " << frame_id
+              << " (" << image_name << ") added to pending queue."
+              << std::endl;
 }
 
 void SfMSystem::extractFeatures(const cv::Mat& image, int frame_id) {
@@ -38,17 +52,28 @@ void SfMSystem::buildGlobalMatchGraph() {
             int id1 = *it1;
             int id2 = *it2;
 
-            std::vector<cv::DMatch> good_matches = matcher.match(all_features_[id1], all_features_[id2]);
-            // 只有两张图之间的特征点数量大于15 才会将这两张图加入到全局的连接图中
-            if (good_matches.size() >= 15) {
-                match_graph_[id1][id2] = good_matches;
-            // 构建对称的全局匹配图，保证“查询视角”的物理逻辑正确，从而构建一个对称的无向图
+            std::vector<cv::DMatch> good_matches =
+                matcher.match(all_features_[id1], all_features_[id2]);
+
+            std::vector<cv::DMatch> verified_matches =
+                filterMatchesByEssential(
+                    all_features_[id1],
+                    all_features_[id2],
+                    good_matches,
+                    K_
+                );
+
+            if (verified_matches.size() >= 30) {
+                match_graph_[id1][id2] = verified_matches;
+
                 std::vector<cv::DMatch> reverse_matches;
-                reverse_matches.reserve(good_matches.size()); 
-                for (const auto& m : good_matches) {
-                    reverse_matches.emplace_back(m.trainIdx, m.queryIdx, m.distance); // 采用emplace_back而不是push_back 在于二者一个是移动一个是复制
+                reverse_matches.reserve(verified_matches.size());
+
+                for (const auto& m : verified_matches) {
+                    reverse_matches.emplace_back(m.trainIdx, m.queryIdx, m.distance);
                 }
-                match_graph_[id2][id1] = reverse_matches;  // 显式构建无向图 
+
+                match_graph_[id2][id1] = reverse_matches;
             }
         }
     }
@@ -89,6 +114,9 @@ void SfMSystem::runReconstruction() {
             runLocalBundleAdjustment(current_frame_id_);
             pending_frames_.erase(current_frame_id_);
             registered_frames_.insert(current_frame_id_);
+            
+            // 当前帧注册 + 局部 BA 完成后，更新 Viewer
+            notifyViewer();
         } else {
             std::cout << "[Warning] Frame " << current_frame_id_ << " failed to register. Discarding." << std::endl;
             pending_frames_.erase(current_frame_id_);
@@ -160,6 +188,10 @@ bool SfMSystem::bootstrapMap() {
     pending_frames_.erase(best_id2);
     registered_frames_.insert(best_id1);
     registered_frames_.insert(best_id2);
+    
+    // 初始化完成后，把第二个初始化相机作为当前帧显示
+    current_frame_id_ = best_id2;
+    notifyViewer();
 
     return true;
 }
@@ -227,6 +259,12 @@ bool SfMSystem::trackAndMapIncremental(int frame_id) {
     std::vector<cv::Point3f> object_3d;
     std::vector<cv::Point2f> object_2d;
     
+    // 记录每个 PnP 候选对应来自哪个 3D 点、当前帧哪个 2D 特征点
+    // object_3d[i] / object_2d[i] 对应：
+    // candidate_pt3d_indices[i] 和 candidate_kp_indices[i]
+    std::vector<int> candidate_pt3d_indices;
+    std::vector<int> candidate_kp_indices;
+    
     // 用于去重：同一个 3D 点可能在历史图 1 和图 2 中都被看到，
     // 防止同一个 3D 点被重复塞进 PnP 数组里
     std::set<int> added_pt3d_idxs; 
@@ -251,10 +289,9 @@ bool SfMSystem::trackAndMapIncremental(int frame_id) {
                     object_2d.push_back(all_features_[frame_id].keypoints[match.queryIdx].pt);
                     added_pt3d_idxs.insert(pt3d_idx);
                     
-                    // 同步更新：告诉这个全局 3D 点，"新相机也看到你了"
-                    global_points_[pt3d_idx].track[frame_id] = match.queryIdx;
-                    // 同步更新：告诉新相机，"你的这个像素点对应的 3D 点索引是它"
-                    all_features_[frame_id].point3d_idx[match.queryIdx] = pt3d_idx;
+                    candidate_pt3d_indices.push_back(pt3d_idx);
+                    candidate_kp_indices.push_back(match.queryIdx);
+                    added_pt3d_idxs.insert(pt3d_idx);
                 }
             }
         }
@@ -269,16 +306,52 @@ bool SfMSystem::trackAndMapIncremental(int frame_id) {
 
     // 执行 PnP，算出新相机位姿
     cv::Mat R, t;
-    bool pnp_success = PoseEstimator::estimatePnP(object_3d, object_2d, K_, R, t);
+    std::vector<int> pnp_inliers;
+
+    bool pnp_success = PoseEstimator::estimatePnP(
+        object_3d,
+        object_2d,
+        K_,
+        R,
+        t,
+        &pnp_inliers
+    );
     
     if (!pnp_success || R.empty() || t.empty()) {
-        std::cerr << "[Warning] PnP RANSAC failed for frame " << frame_id << std::endl;
+    std::cerr << "[Warning] PnP RANSAC failed for frame " << frame_id << std::endl;
+    return false;
+    }
+
+    if (pnp_inliers.size() < 15) {
+        std::cerr << "[Warning] Too few PnP inliers for frame " << frame_id
+                << ". Inliers: " << pnp_inliers.size()
+                << " / " << object_3d.size() << std::endl;
         return false;
     }
 
     // 成功！将新相机的绝对位姿记入系统史册
     camera_R_[frame_id] = R.clone();
     camera_t_[frame_id] = t.clone();
+    // 只把 PnP RANSAC 内点观测写入 track 和 point3d_idx
+    for (int inlier_idx : pnp_inliers) {
+        if (inlier_idx < 0 || inlier_idx >= static_cast<int>(candidate_pt3d_indices.size())) {
+            continue;
+        }
+
+        int pt3d_idx = candidate_pt3d_indices[inlier_idx];
+        int kp_idx = candidate_kp_indices[inlier_idx];
+
+        if (pt3d_idx < 0 || pt3d_idx >= static_cast<int>(global_points_.size())) {
+            continue;
+        }
+
+        if (kp_idx < 0 || kp_idx >= static_cast<int>(all_features_[frame_id].point3d_idx.size())) {
+            continue;
+        }
+
+        global_points_[pt3d_idx].track[frame_id] = kp_idx;
+        all_features_[frame_id].point3d_idx[kp_idx] = pt3d_idx;
+    }
     std::cout << "[SfMSystem] PnP solved. Frame " << frame_id << " localized using " 
               << object_3d.size() << " points." << std::endl;
 
@@ -435,7 +508,14 @@ void SfMSystem::exportToCOLMAP(const std::string& export_dir) const {
         }
         Eigen::Quaterniond q(eigen_R);
 
-        std::string img_name = "img" + std::to_string(img_id) + ".jpg";
+        std::string img_name;
+
+        auto name_it = image_names_.find(img_id);
+        if (name_it != image_names_.end()) {
+            img_name = name_it->second;
+        } else {
+            img_name = "img" + std::to_string(img_id) + ".jpg";
+        }
 
         // 第一行：写入四元数位姿和平移
         img_out << img_id << " " << q.w() << " " << q.x() << " " << q.y() << " " << q.z() << " "
@@ -477,4 +557,60 @@ void SfMSystem::exportToCOLMAP(const std::string& export_dir) const {
     pt_out.close();
 
     std::cout << "[SfMSystem] Successfully exported COLMAP format to directory: " << export_dir << std::endl;
+}
+
+void SfMSystem::setViewer(std::shared_ptr<Viewer> viewer) {
+    viewer_ = viewer;
+}
+
+void SfMSystem::notifyViewer() {
+    if (viewer_) {
+        viewer_->updateMap(camera_R_, camera_t_, global_points_, current_frame_id_);
+    }
+}
+std::vector<cv::DMatch> SfMSystem::filterMatchesByEssential(
+    const FeatureData& data1,
+    const FeatureData& data2,
+    const std::vector<cv::DMatch>& matches,
+    const cv::Mat& K
+) {
+    std::vector<cv::DMatch> inlier_matches;
+
+    if (matches.size() < 15) {
+        return inlier_matches;
+    }
+
+    std::vector<cv::Point2f> pts1;
+    std::vector<cv::Point2f> pts2;
+
+    pts1.reserve(matches.size());
+    pts2.reserve(matches.size());
+
+    for (const auto& m : matches) {
+        pts1.push_back(data1.keypoints[m.queryIdx].pt);
+        pts2.push_back(data2.keypoints[m.trainIdx].pt);
+    }
+
+    cv::Mat mask;
+    cv::Mat E = cv::findEssentialMat(
+        pts1,
+        pts2,
+        K,
+        cv::RANSAC,
+        0.999,
+        1.0,
+        mask
+    );
+
+    if (E.empty() || mask.empty()) {
+        return inlier_matches;
+    }
+
+    for (int i = 0; i < static_cast<int>(matches.size()); ++i) {
+        if (mask.at<uchar>(i)) {
+            inlier_matches.push_back(matches[i]);
+        }
+    }
+
+    return inlier_matches;
 }

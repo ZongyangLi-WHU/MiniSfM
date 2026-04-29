@@ -27,11 +27,12 @@ public:
                             // 新增：保存点云为 PLY 文件
     static void savePLY(const std::string& filename, const std::vector<Point3D>& points);
 
-    static bool estimatePnP( const std::vector<cv::Point3f>& object_3d,
-                             const std::vector<cv::Point2f>& object_2d,
-                             const cv::Mat &k,
-                             cv::Mat& R,
-                             cv::Mat& t);
+    static bool estimatePnP(const std::vector<cv::Point3f>& object_3d,
+                        const std::vector<cv::Point2f>& object_2d,
+                        const cv::Mat& K,
+                        cv::Mat& R,
+                        cv::Mat& t,
+                        std::vector<int>* inliers_out = nullptr);
                              
     // 更新：全局与局部 Bundle Adjustment 联合优化接口
     static void optimize(std::map<int, cv::Mat>& camera_R,        
@@ -45,7 +46,7 @@ public:
     static void analyzeAndCleanErrors(const std::map<int, cv::Mat>& camera_R,
                                       const std::map<int, cv::Mat>& camera_t,
                                       std::vector<Point3D>& global_points,
-                                      const std::map<int, FeatureData>& all_features,
+                                      std::map<int, FeatureData>& all_features,
                                       const cv::Mat& K,
                                       double error_threshold = 2.0); // 默认剔除误差大于 2 个像素的坏点
 };

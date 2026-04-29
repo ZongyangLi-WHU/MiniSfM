@@ -23,6 +23,11 @@ message(STATUS "Ceres Solver found: ${Ceres_DIR}")
 find_package(Eigen3 REQUIRED)
 message(STATUS "Eigen3 include path: ${EIGEN3_INCLUDE_DIRS}")
 
+find_package(Pangolin REQUIRED)
+
+
+add_compile_definitions(GL_GLEXT_PROTOTYPES)
+
 # ==========================================
 # 设置头文件包含路径
 # ==========================================
@@ -31,15 +36,25 @@ include_directories(
     ${OpenCV_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIRS}
     ${CERES_INCLUDE_DIRS}
+    ${Pangolin_INCLUDE_DIRS}
 )
 
 # ==========================================
 # 编译可执行文件并链接库
 # ==========================================
 # 将 src/main.cpp 编译为名为 sfm_test 的可执行文件
-add_executable(sfm_test src/main.cpp src/feature.cpp
+add_executable(
+    sfm_test src/main.cpp 
+    src/feature.cpp
     src/geometry.cpp
-    src/sfm_system.cpp )
+    src/sfm_system.cpp
+    src/viewer.cpp )
 
-# 将 OpenCV 的库链接到我们的程序上
-target_link_libraries(sfm_test ${OpenCV_LIBS} ${CERES_LIBRARIES})
+
+target_link_libraries(sfm_test
+    ${OpenCV_LIBS}
+    ${CERES_LIBRARIES}
+    ${Pangolin_LIBRARIES}
+    OpenGL::GL
+    pthread
+)
